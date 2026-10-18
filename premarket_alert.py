@@ -13,6 +13,9 @@
   PREV_DAY_MAX_VOL_RATIO    前日出来高 / その前5日平均 がこれ以上なら除外 (既定 2.0)
   LATEST_RUN_TIME           JPでこの時刻を過ぎて起動したら判定せずに終了 (既定 09:40)
   FORCE_RUN                 1 なら LATEST_RUN_TIME のガードを無視 (手動テスト用)
+  CATALYST_MODE             材料フィルター。off (既定・テクニカルのみ) / tag (材料銘柄に📰を付ける)
+                            / only (材料銘柄だけ通知)
+  CATALYST_FILE             材料ファイルのパス (既定 catalysts.csv)
 """
 import os
 import re
@@ -30,6 +33,8 @@ WATCHLIST_FILE = os.path.join(BASE_DIR, "watchlist.txt" if MARKET == "JP" else "
 LATEST_RUN_TIME = os.environ.get("LATEST_RUN_TIME", "09:40")
 MAX_FAIL_RATIO = 0.10      # 取得失敗がこれを超えたら警告
 MAX_DATA_LAG_MIN = 30      # データ時刻が実行時刻からこれ以上遅れていたら警告
+CATALYST_MODE = os.environ.get("CATALYST_MODE", "off").strip().lower()
+CATALYST_FILE = os.environ.get("CATALYST_FILE", os.path.join(BASE_DIR, "catalysts.csv"))
 
 
 def load_watchlist():
@@ -46,7 +51,7 @@ def load_watchlist():
     return codes, meta
 
 
-def run_checks(codes, now):
+def run_checks(codes, now, catalysts=None):
     symbols = [f"{c}{SUFFIX}" for c in codes]
     intraday = strategy.download(symbols, period="8d", interval="1m", prepost=(MARKET != "JP"))
     daily = strategy.download(symbols, period="1mo", interval="1d")
@@ -79,13 +84,31 @@ def run_checks(codes, now):
             continue
         stats["evaluated"] += 1
         if r["status"] == "hit":
-            hits.append({"code": code, **r})
+            hits.append({"code": code, "catalyst": strategy.catalyst_memo(catalysts or {}, today, code), **r})
+    stats["tech_hits"] = len(hits)
+    if CATALYST_MODE == "only":
+        hits = [h for h in hits if h["catalyst"] is not None]
     stats["hits"] = len(hits)
     stats["data_time"] = max(data_times) if data_times else None
     return hits, stats
 
 
-def status_line(now, stats, meta):
+def catalyst_status(now, catalysts, codes):
+    """材料ファイルの状況を (サマリーに付ける文字列, 警告のリスト) で返す"""
+    if CATALYST_MODE == "off":
+        return "", []
+    if catalysts is None:
+        return f" | 材料[{CATALYST_MODE}] ファイルなし", [f"材料ファイルがない ({os.path.basename(CATALYST_FILE)})"]
+    today = now.date()
+    if today not in catalysts:
+        return f" | 材料[{CATALYST_MODE}] 今日の記録なし", ["今日の材料が記録されていない"]
+    picks = catalysts[today]
+    outside = [c for c in picks if c not in set(codes)]
+    note = f" (うちリスト外 {len(outside)}: {' '.join(outside)})" if outside else ""
+    return f" | 材料[{CATALYST_MODE}] {len(picks)}銘柄{note}", []
+
+
+def status_line(now, stats, meta, catalyst=("", [])):
     """毎朝送る1行サマリー。異常 (取得失敗・リストが古い・データ遅延) があれば ⚠️ を付ける"""
     warnings = []
     s = stats
@@ -106,25 +129,33 @@ def status_line(now, stats, meta):
     updated = meta.get("更新日", "不明")
     if not updated.startswith(now.strftime("%Y-%m-%d")):
         warnings.append("ウォッチリストが今日更新されていない")
+    catalyst_note, catalyst_warnings = catalyst
+    warnings += catalyst_warnings
     fetched = f" (取得 {meta['取得成功']})" if "取得成功" in meta else ""
 
     icon = ":warning:" if warnings else ":clipboard:"
     line = (f"{icon} {now:%m/%d %H:%M} [{MARKET}] {s['total']}銘柄チェック / 取得失敗 {s['failed']}"
             f" / 当日データなし {s['no_today']} / データ不足 {s['nodata']} / 判定 {s['evaluated']}"
-            f" / 該当 {s['hits']} | {data} | リスト更新 {updated}{fetched}")
+            f" / 該当 {s['hits']}" + (f" (テクニカルのみ {s['tech_hits']})" if CATALYST_MODE == "only" else "")
+            + f" | {data} | リスト更新 {updated}{fetched}{catalyst_note}")
     if warnings:
         line += "\n:warning: " + " / ".join(warnings)
     return line
 
 
 def hits_message(hits):
-    lines = [f":rotating_light: *強い銘柄アラート* [{MARKET}] ({hits[0]['data_time']:%Y-%m-%d})",
+    only = " (材料銘柄のみ)" if CATALYST_MODE == "only" else ""
+    lines = [f":rotating_light: *強い銘柄アラート* [{MARKET}]{only} ({hits[0]['data_time']:%Y-%m-%d})",
              strategy.condition_summary()]
     for h in sorted(hits, key=lambda x: x["change"], reverse=True):
+        mark, memo = "", ""
+        if CATALYST_MODE != "off" and h.get("catalyst") is not None:
+            mark = f"{strategy.CATALYST_MARK} "
+            memo = f"\n    {strategy.CATALYST_MARK} {h['catalyst']}" if h["catalyst"] else ""
         lines.append(
-            f"• *{h['code']}*  {h['data_time']:%H:%M}時点 {h['price']:,.2f}{CURRENCY} "
+            f"• {mark}*{h['code']}*  {h['data_time']:%H:%M}時点 {h['price']:,.2f}{CURRENCY} "
             f"(前日比 {h['change']:+.1%} / 寄りギャップ {h['open_gap']:+.1%} / 高値 {h['high']:,.2f} から -{h['drop_from_high']:.1%})  "
-            f"RVOL {h['rvol']:.1f}倍 (同時刻までの出来高 {h['volume']:,.0f} / 過去平均 {h['base_vol']:,.0f})"
+            f"RVOL {h['rvol']:.1f}倍 (同時刻までの出来高 {h['volume']:,.0f} / 過去平均 {h['base_vol']:,.0f}){memo}"
         )
     return "\n".join(lines)
 
@@ -138,6 +169,8 @@ def main():
     webhook_url = os.environ.get("SLACK_WEBHOOK_URL")
     if not webhook_url:
         sys.exit("SLACK_WEBHOOK_URL を環境変数に設定してください")
+    if CATALYST_MODE not in strategy.CATALYST_MODES:
+        sys.exit(f"CATALYST_MODE は {' / '.join(strategy.CATALYST_MODES)} のどれかにしてください ({CATALYST_MODE!r})")
 
     now = datetime.now(ZoneInfo(TZ))
     # スリープ復帰で launchd が遅れて起動した場合、古いシグナルで発注しないよう何もしない
@@ -148,8 +181,11 @@ def main():
         return
 
     codes, meta = load_watchlist()
-    hits, stats = run_checks(codes, now)
-    status = status_line(now, stats, meta)
+    catalysts = None
+    if CATALYST_MODE != "off" and os.path.exists(CATALYST_FILE):
+        catalysts = strategy.load_catalysts(CATALYST_FILE)
+    hits, stats = run_checks(codes, now, catalysts)
+    status = status_line(now, stats, meta, catalyst_status(now, catalysts, codes))
     print(status)
 
     text = f"{hits_message(hits)}\n{status}" if hits else status

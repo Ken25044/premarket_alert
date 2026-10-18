@@ -2,9 +2,10 @@
 
 ライブの通知とバックテストが必ず同じ条件で判定されるよう、条件はここにだけ書く。
 """
+import csv
 import os
 import time
-from datetime import time as dtime
+from datetime import datetime, time as dtime
 
 import pandas as pd
 import yfinance as yf
@@ -140,6 +141,44 @@ def evaluate(today_bars, past_bars, prev_close, today_open):
 def condition_summary():
     return (f"前日比+{MIN_CHANGE:.0%}〜{MAX_CHANGE:.0%} / 陽線 / 時刻別RVOL {RVOL_THRESHOLD}倍以上 "
             f"/ 高値から{CLOSE_TO_HIGH_THRESHOLD:.1%}以内")
+
+
+# --- 材料 (前夜に PTS / 株探などで調べて手で記録した銘柄) ---
+CATALYST_MODES = ("off", "tag", "only")
+CATALYST_MARK = "📰"
+
+
+def load_catalysts(path):
+    """catalysts.csv を {取引日: {コード: メモ}} で返す
+
+    1行 = date,code,memo。date はその銘柄を狙う取引日 (YYYY-MM-DD か YYYY/MM/DD)。
+    # で始まる行・空行・ヘッダー行 (date,code,memo) は読み飛ばす。
+    memo は省略可で、カンマを含んでもよい (3列目以降をつなげる)。
+    code が空の行は「その日は調べたが該当なし」の印 (その日を記録済みとして扱う)。
+    """
+    catalysts = {}
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        for n, row in enumerate(csv.reader(f), 1):
+            if not row or not row[0].strip() or row[0].lstrip().startswith("#"):
+                continue
+            if row[0].strip().lower() == "date":
+                continue
+            raw_date = row[0].strip().replace("/", "-")
+            try:
+                d = datetime.strptime(raw_date, "%Y-%m-%d").date()
+            except ValueError:
+                print(f"{path}:{n}: 日付が読めないので無視します ({row[0]!r})")
+                continue
+            picks = catalysts.setdefault(d, {})
+            code = row[1].strip().upper().removesuffix(SUFFIX) if len(row) > 1 else ""
+            if code:
+                picks[code] = ",".join(row[2:]).strip()
+    return catalysts
+
+
+def catalyst_memo(catalysts, d, code):
+    """その日にその銘柄が材料ありならメモ (空文字のこともある) を、なければ None を返す"""
+    return catalysts.get(d, {}).get(str(code).upper().removesuffix(SUFFIX))
 
 
 def download(symbols, chunk_size=100, on_chunk=None, pause=0, **kwargs):

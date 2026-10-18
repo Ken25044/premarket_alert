@@ -18,6 +18,7 @@
   python backtest.py --run-time 09:40        # 実行を遅らせてデータが揃うのを待った場合
   python backtest.py --universe jpx          # 今日のウォッチリストではなく東証全銘柄から再現
   python backtest.py --csv trades.csv        # 全トレードをCSVに保存
+  python backtest.py --catalysts catalysts.csv  # 材料あり/なしに分けて成績を出す
 
 制約:
   - yfinance の1分足は直近30日分しか取れない。サンプルは少ないので、結果は目安として見ること
@@ -119,6 +120,40 @@ def summarize(label, trades, days):
     print(f"決済の内訳        {by_type}")
 
 
+def summarize_catalysts(catalysts, sig, base, trade_days):
+    """材料ファイルに記録がある日だけに絞って、材料あり/なしで成績を分ける
+
+    記録のない日は「材料なし」ではなく「調べていない」なので、どちらにも入れない。
+    """
+    covered = sorted(d for d in catalysts if d in trade_days)
+    picks = {(d, c) for d in covered for c in catalysts[d]}
+    print(f"\n材料ファイルの記録がある日: 検証期間 {len(trade_days)} 営業日のうち {len(covered)} 日"
+          f" / 材料銘柄 {len(picks)} 件")
+    if not covered:
+        print("検証期間内に材料の記録がないので、材料別の集計はしません")
+        return
+    on_list = set(zip(base["date"], base["code"])) if not base.empty else set()
+    outside = sorted(picks - on_list)
+    if outside:
+        print(f"その日のウォッチリスト外 (or 分足なし) で検証対象外: {len(outside)} 件 "
+              + " ".join(f"{d:%m/%d}:{c}" for d, c in outside))
+
+    def split(df):
+        if df.empty:
+            return df, df
+        df = df[df["date"].isin(covered)]
+        has = df["catalyst"].notna()
+        return df[has], df[~has]
+
+    days = len(covered)
+    sig_yes, sig_no = split(sig)
+    base_yes, _ = split(base)
+    summarize(f"アラート条件 × 材料あり (記録のある {days} 日)", sig_yes, days)
+    summarize(f"アラート条件 × 材料なし (記録のある {days} 日)", sig_no, days)
+    summarize(f"ベースライン × 材料あり: 材料銘柄をテクニカル条件なしで全部買った場合 (記録のある {days} 日)",
+              base_yes, days)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--run-time", default="09:25", help="アラートの実行時刻 (既定 09:25)")
@@ -131,6 +166,7 @@ def main():
     p.add_argument("--fee", type=float, default=0.0, help="片道の手数料 %% (既定 0)")
     p.add_argument("--universe", choices=["watchlist", "jpx"], default="watchlist")
     p.add_argument("--csv", help="全トレードを保存するCSVのパス")
+    p.add_argument("--catalysts", help="材料ファイル (catalysts.csv)。指定すると材料あり/なしに分けて集計する")
     args = p.parse_args()
 
     run_time = parse_hhmm(args.run_time)
@@ -138,6 +174,8 @@ def main():
     entry_time = shift(run_time, args.reaction)     # 実際に発注できる時刻
     print(f"実行 {run_time:%H:%M} / 見えているデータ {data_until:%H:%M} まで / エントリー {entry_time:%H:%M}"
           f" / 利確 +{args.tp}% / 損切 -{args.sl}% / スリッページ 片道{args.slippage}% / 手数料 片道{args.fee}%")
+
+    catalysts = strategy.load_catalysts(args.catalysts) if args.catalysts else None
 
     codes = load_universe(args.universe)
     symbols = [f"{c}{SUFFIX}" for c in codes]
@@ -168,6 +206,8 @@ def main():
                 continue  # 期間の最初の数日は RVOL の比較対象がない
             trade_days.add(d)
             row = {"date": d, "code": sym.removesuffix(SUFFIX)}
+            if catalysts is not None:
+                row["catalyst"] = strategy.catalyst_memo(catalysts, d, row["code"])
 
             trade = simulate(bars, entry_time, args)
             if trade:
@@ -188,13 +228,19 @@ def main():
             前日比=sig["change"].map("{:+.1%}".format), RVOL=sig["rvol"].map("{:.1f}".format),
             買値=sig["buy"].round(1), 売値=sig["sell"].round(1), 損益=sig["return_pct"].map("{:+.2f}%".format),
             エントリー=sig["entry_at"].dt.strftime("%H:%M"), 決済=sig["exit_at"].dt.strftime("%H:%M"))
+        cols = ["date", "code", "前日比", "RVOL", "エントリー", "買値", "決済", "売値", "exit_type", "損益"]
+        if catalysts is not None:
+            view["材料"] = sig["catalyst"].map(lambda m: "" if m is None else f"{strategy.CATALYST_MARK} {m}".strip())
+            cols.append("材料")
         print("\n--- シグナル一覧 ---")
-        print(view[["date", "code", "前日比", "RVOL", "エントリー", "買値", "決済", "売値", "exit_type", "損益"]]
-              .sort_values(["date", "code"]).to_string(index=False))
+        print(view[cols].sort_values(["date", "code"]).to_string(index=False))
     if trade_days:
         print(f"\n検証期間: {min(trade_days)} 〜 {max(trade_days)}")
     summarize("アラート条件でエントリー", sig, days)
-    summarize("ベースライン: その日のウォッチリスト全銘柄を同じルールで買った場合", pd.DataFrame(baseline), days)
+    base = pd.DataFrame(baseline)
+    summarize("ベースライン: その日のウォッチリスト全銘柄を同じルールで買った場合", base, days)
+    if catalysts is not None:
+        summarize_catalysts(catalysts, sig, base, trade_days)
 
     if args.csv and not sig.empty:
         sig.to_csv(args.csv, index=False)

@@ -1,12 +1,10 @@
 """寄り直後/プレマーケットの強い銘柄チェック → Slack通知 (yfinance のみ・無料)
 
-条件:
-  1. 現在値が前日終値比 +3% 以上
-  2. 当日出来高(プレ含む・ここまで)が、過去5営業日の平均出来高の一定割合以上
+条件の詳細は README.md の「売買手法とフィルター条件」を参照。
 
 環境変数:
   SLACK_WEBHOOK_URL  Slack Incoming Webhook URL (必須)
-  MARKET             US (既定) / JP
+  MARKET             JP (既定) / US
   GAP_THRESHOLD             前日比の下限しきい値 (既定 0.03)
   MAX_GAP_THRESHOLD         前日比の上限しきい値 (既定 0.10 = 10%超えは除外)
   TARGET_DAILY_RATIO        1日の終わり時点での期待出来高倍率 (既定 1.5)

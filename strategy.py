@@ -5,7 +5,7 @@
 import csv
 import os
 import time
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timedelta
 
 import pandas as pd
 import yfinance as yf
@@ -29,6 +29,9 @@ def _env(name, default, legacy=None):
         value = os.environ.get(legacy)
     return float(value if value is not None else default)
 
+
+INTRADAY_DAYS = 29         # yfinance の1分足は直近30日以内しか取れない
+INTRADAY_WINDOW_DAYS = 7   # 1リクエストで取れる1分足は最大8日分
 
 # --- ステップ1: ウォッチリスト抽出 (日足) ---
 MIN_PRICE = 250            # 最低株価
@@ -179,6 +182,26 @@ def load_catalysts(path):
 def catalyst_memo(catalysts, d, code):
     """その日にその銘柄が材料ありならメモ (空文字のこともある) を、なければ None を返す"""
     return catalysts.get(d, {}).get(str(code).upper().removesuffix(SUFFIX))
+
+
+def download_intraday(symbols, since=None):
+    """1分足を since (date) から今日まで、7日ずつに分けて取得してつなぐ。
+
+    since を省略するか30日より前なら、取れるだけ (直近 INTRADAY_DAYS 日) 取る。
+    """
+    now = pd.Timestamp.now(tz=TZ)
+    end = now.normalize() + timedelta(days=1)
+    start = (now - timedelta(days=INTRADAY_DAYS)).ceil("h")
+    if since is not None:
+        start = max(start, pd.Timestamp(since, tz=TZ))
+    parts = {}
+    while start < end:
+        stop = min(start + timedelta(days=INTRADAY_WINDOW_DAYS), end)
+        print(f"  1分足 {start:%m/%d}〜{stop:%m/%d} を取得中...")
+        for sym, df in download(symbols, start=start, end=stop, interval="1m").items():
+            parts.setdefault(sym, []).append(df)
+        start = stop
+    return {sym: pd.concat(dfs).sort_index().loc[lambda d: ~d.index.duplicated()] for sym, dfs in parts.items()}
 
 
 def download(symbols, chunk_size=100, on_chunk=None, pause=0, **kwargs):

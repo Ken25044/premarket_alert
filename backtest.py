@@ -17,14 +17,23 @@
   python backtest.py                         # 9:25実行・20分遅延・2分後に発注 (今の運用)
   python backtest.py --run-time 09:40        # 実行を遅らせてデータが揃うのを待った場合
   python backtest.py --universe jpx          # 今日のウォッチリストではなく東証全銘柄から再現
+  python backtest.py --no-archive            # 保存した1分足を使わず、yfinance の直近30日だけで検証
   python backtest.py --csv trades.csv        # 全トレードをCSVに保存
   python backtest.py --catalysts catalysts.csv  # 材料あり/なしに分けて成績を出す
 
+銘柄の母集団 (--universe):
+  auto (既定)  archive.py で保存したデータがあれば archive、なければ watchlist
+  archive      保存済みの全銘柄 (過去30日のウォッチリストに1日でも入った銘柄)。途中でリストから
+               外れた銘柄も含むので生存バイアスがない
+  watchlist    今日の watchlist.txt の銘柄だけ。途中で外れた銘柄が抜ける (生存バイアス)
+  jpx          東証全銘柄 (日足を全部取るので時間がかかる)
+
+1分足は archive.py で保存した分と yfinance の直近30日分をつないで使う (--no-archive で直近30日だけ)。
+
 制約:
-  - yfinance の1分足は直近30日分しか取れない。サンプルは少ないので、結果は目安として見ること
+  - 保存を始める前の期間は yfinance の直近30日分しかない。保存がたまるほど検証期間が延びる
   - 1分足は 9:04〜9:05 から始まる日が大半 (寄り直後の足と寄り板の出来高が欠ける)
-  - --universe watchlist (既定) は「今日のリストに残っている銘柄」に限られるため、
-    途中で条件から外れた銘柄が抜け落ちる (生存バイアス)。厳密に見るなら --universe jpx
+  - 上場廃止になった銘柄は yfinance から日足が取れなくなるので検証から抜ける
 """
 import argparse
 from bisect import bisect_left, bisect_right
@@ -32,14 +41,12 @@ from datetime import datetime, time as dtime, timedelta
 
 import pandas as pd
 
+import archive
 import strategy
 from strategy import SUFFIX, TZ
 
 pd.set_option("display.unicode.east_asian_width", True)
 pd.set_option("display.width", 200)
-
-INTRADAY_DAYS = 29   # yfinance の1分足は直近30日以内
-WINDOW_DAYS = 7      # 1リクエストで取れる1分足は最大8日分
 
 
 def parse_hhmm(s):
@@ -54,23 +61,10 @@ def load_universe(name):
     if name == "jpx":
         from update_watchlist import get_jpx_codes
         return get_jpx_codes()
+    if name == "archive":
+        return archive.archived_codes()
     from premarket_alert import load_watchlist
     return load_watchlist()[0]
-
-
-def download_intraday(symbols):
-    """直近30日分の1分足を 7日ずつに分けて取得してつなぐ"""
-    now = pd.Timestamp.now(tz=TZ)
-    end = now.normalize() + timedelta(days=1)
-    start = (now - timedelta(days=INTRADAY_DAYS)).ceil("h")
-    parts = {}
-    while start < end:
-        stop = min(start + timedelta(days=WINDOW_DAYS), end)
-        print(f"  1分足 {start:%m/%d}〜{stop:%m/%d} を取得中...")
-        for sym, df in strategy.download(symbols, start=start, end=stop, interval="1m").items():
-            parts.setdefault(sym, []).append(df)
-        start = stop
-    return {sym: pd.concat(dfs).sort_index().loc[lambda d: ~d.index.duplicated()] for sym, dfs in parts.items()}
 
 
 def simulate(bars, entry_time, args):
@@ -168,7 +162,8 @@ def main():
     p.add_argument("--hold-minutes", type=int, default=None, help="最大保有時間 (分, 既定は大引けまで)")
     p.add_argument("--slippage", type=float, default=0.1, help="片道のスリッページ %% (既定 0.1)")
     p.add_argument("--fee", type=float, default=0.0, help="片道の手数料 %% (既定 0)")
-    p.add_argument("--universe", choices=["watchlist", "jpx"], default="watchlist")
+    p.add_argument("--universe", choices=["auto", "archive", "watchlist", "jpx"], default="auto")
+    p.add_argument("--no-archive", action="store_true", help="保存した1分足を使わない (yfinance の直近30日だけ)")
     p.add_argument("--csv", help="全トレードを保存するCSVのパス")
     p.add_argument("--catalysts", help="材料ファイル (catalysts.csv)。指定すると材料あり/なしに分けて集計する")
     args = p.parse_args()
@@ -181,37 +176,58 @@ def main():
 
     catalysts = strategy.load_catalysts(args.catalysts) if args.catalysts else None
 
-    codes = load_universe(args.universe)
+    stored = [] if args.no_archive else archive.archived_dates()
+    universe = args.universe
+    if universe == "auto":
+        universe = "archive" if stored else "watchlist"
+    if universe == "archive" and not stored:
+        raise SystemExit("保存済みの1分足がありません。先に python archive.py --universe jpx を実行してください")
+    codes = load_universe(universe)
     symbols = [f"{c}{SUFFIX}" for c in codes]
-    print(f"\n日足を取得中 ({len(symbols)} 銘柄)...")
-    daily = {s: d.dropna() for s, d in strategy.download(symbols, period="1y", interval="1d").items()}
+
+    now = pd.Timestamp.now(tz=TZ)
+    first_day = (now - timedelta(days=strategy.INTRADAY_DAYS)).date()
+    if stored:
+        first_day = min(first_day, stored[0])
+    print(f"\n母集団: {universe} ({len(symbols)} 銘柄) / 1分足: "
+          + (f"保存分 {stored[0]}〜{stored[-1]} ({len(stored)}日) + " if stored else "")
+          + "yfinance 直近30日")
+
+    # 日足は、検証初日の時点でウォッチリスト条件 (75日線・80日分の履歴) を判定できるだけさかのぼる
+    daily_start = min(now - timedelta(days=365), pd.Timestamp(first_day, tz=TZ) - timedelta(days=200))
+    print(f"日足を取得中 ({len(symbols)} 銘柄)...")
+    daily = {s: d.dropna() for s, d in strategy.download(symbols, start=daily_start, interval="1d").items()}
 
     # 1分足は重いので、検証期間中に一度でもウォッチリスト条件を満たした銘柄だけ取得する
-    first_day = (pd.Timestamp.now(tz=TZ) - timedelta(days=INTRADAY_DAYS)).date()
     masks = {s: strategy.watchlist_mask(d) for s, d in daily.items()}
     candidates = [s for s, m in masks.items() if m[m.index.date >= first_day - timedelta(days=7)].any()]
     print(f"検証期間中にウォッチリスト入りした銘柄: {len(candidates)} / {len(daily)}")
-    intraday = download_intraday(candidates)
+    intraday = strategy.download_intraday(candidates)
+    if stored:
+        intraday = archive.merge_intraday(intraday, archive.load_intraday(candidates))
 
-    signals, baseline, trade_days = [], [], set()
+    # 全銘柄の1分足にある日付 = 営業日カレンダー。RVOL の比較対象は「直前の N 営業日」をここから取る
+    calendar = sorted({d for df in intraday.values() for d in set(df.index.date)})
+    signals, baseline, trade_days, no_bars = [], [], set(), 0
     for sym in candidates:
         intra, day, mask = intraday.get(sym), daily[sym], masks[sym]
-        if intra is None:
-            continue
         # 日付での切り出しは銘柄ごとに1回だけ (毎日 index.date を作り直すと遅い)
-        bars_by_day = dict(tuple(intra.groupby(intra.index.date)))
-        dates = sorted(bars_by_day)
+        bars_by_day = dict(tuple(intra.groupby(intra.index.date))) if intra is not None else {}
         day_dates = list(day.index.date)
-        for i, d in enumerate(dates):
-            if i < strategy.RVOL_MIN_DAYS:
-                continue  # 期間の最初の数日は RVOL の比較対象がない
+        for k, d in enumerate(calendar):
             lo, hi = bisect_left(day_dates, d), bisect_right(day_dates, d)
             past, today_daily = day.iloc[:lo], day.iloc[lo:hi]
             if past.empty or today_daily.empty or not mask.iloc[lo - 1]:
-                continue  # その日の朝のウォッチリストに入っていない
+                continue  # その日の朝のウォッチリストに入っていない (or 売買なし)
+            if d not in bars_by_day:
+                if k >= strategy.RVOL_MIN_DAYS:
+                    no_bars += 1  # リスト入りしていたのに1分足が保存されていない
+                continue
+            prev = [bars_by_day[x] for x in calendar[max(0, k - strategy.RVOL_DAYS):k] if x in bars_by_day]
+            if len(prev) < strategy.RVOL_MIN_DAYS:
+                continue  # 期間の最初の数日は RVOL の比較対象がない
             bars = bars_by_day[d]
-            # evaluate が見るのは直近 RVOL_DAYS 日分だけなので、それだけ渡す
-            past_bars = pd.concat([bars_by_day[x] for x in dates[max(0, i - strategy.RVOL_DAYS):i]])
+            past_bars = pd.concat(prev)  # evaluate が見るのは直近 RVOL_DAYS 日分だけ
             trade_days.add(d)
             row = {"date": d, "code": sym.removesuffix(SUFFIX)}
             if catalysts is not None:
@@ -230,6 +246,9 @@ def main():
                 signals.append({**row, "change": r["change"], "rvol": r["rvol"], **trade})
 
     days = max(len(trade_days), 1)
+    if no_bars:
+        print(f"\n※ ウォッチリスト入りしていたのに1分足がない: {no_bars} 件 (銘柄×日)。"
+              "保存を始める前の日か、archive.py が動かなかった日の分です")
     sig = pd.DataFrame(signals)
     if not sig.empty:
         view = sig.assign(

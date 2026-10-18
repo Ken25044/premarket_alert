@@ -7,6 +7,9 @@ secrets.env
 # 毎朝自動生成されるファイル
 watchlist.txt
 
+# archive.py が貯める1分足とウォッチリストの履歴 (大きくなるのでリポジトリに入れない)
+data/
+
 # 毎晩手で書く材料メモ (個人の売買メモなのでリポジトリに入れない。例は catalysts.example.csv)
 catalysts.csv
 

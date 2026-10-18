@@ -20,6 +20,7 @@ import urllib.request
 import pandas as pd
 from bs4 import BeautifulSoup
 
+import archive
 import strategy
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -70,6 +71,8 @@ def update_watchlist():
         f.write(f"# 取得成功: {len(daily)}/{len(codes)}\n")
         for c in passed_codes:
             f.write(f"{c}\n")
+    # 日付つきで残しておき、バックテストで「その日に実際に使ったリスト」を再現できるようにする
+    archive.save_watchlist_snapshot(passed_codes, pd.Timestamp.now(tz=strategy.TZ).date())
 
 if __name__ == "__main__":
     update_watchlist()

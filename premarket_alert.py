@@ -64,18 +64,19 @@ def run_checks(codes, now, catalysts=None):
         if intra is None or day is None:
             stats["failed"] += 1
             continue
-        today_bars = intra[intra.index.date == today]
+        intra_dates, day_dates = intra.index.date, day.index.date
+        today_bars = intra[intra_dates == today]
         if today_bars.empty:
             stats["no_today"] += 1
             continue
-        past = day[day.index.date < today]
+        past = day[day_dates < today]
         if not strategy.prev_day_ok(past):
             stats["evaluated"] += 1
             continue
-        today_daily = day[day.index.date == today]
+        today_daily = day[day_dates == today]
         # 1分足は寄り直後の数本が欠けるので、始値は日足の当日Openを優先する
         today_open = float(today_daily["Open"].iloc[0]) if len(today_daily) else float(today_bars["Open"].iloc[0])
-        r = strategy.evaluate(today_bars, intra[intra.index.date < today],
+        r = strategy.evaluate(today_bars, intra[intra_dates < today],
                               float(past["Close"].iloc[-1]), today_open)
         if "data_time" in r:
             data_times.append(r["data_time"])
@@ -103,7 +104,8 @@ def catalyst_status(now, catalysts, codes):
     if today not in catalysts:
         return f" | 材料[{CATALYST_MODE}] 今日の記録なし", ["今日の材料が記録されていない"]
     picks = catalysts[today]
-    outside = [c for c in picks if c not in set(codes)]
+    on_list = set(codes)
+    outside = [c for c in picks if c not in on_list]
     note = f" (うちリスト外 {len(outside)}: {' '.join(outside)})" if outside else ""
     return f" | 材料[{CATALYST_MODE}] {len(picks)}銘柄{note}", []
 

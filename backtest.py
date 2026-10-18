@@ -27,6 +27,7 @@
     途中で条件から外れた銘柄が抜け落ちる (生存バイアス)。厳密に見るなら --universe jpx
 """
 import argparse
+from bisect import bisect_left, bisect_right
 from datetime import datetime, time as dtime, timedelta
 
 import pandas as pd
@@ -83,15 +84,18 @@ def simulate(bars, entry_time, args):
     if args.hold_minutes is not None:
         after = after[after.index <= entry_at + timedelta(minutes=args.hold_minutes)]
 
-    exit_type, exit_price, exit_at = None, None, None
-    for t, row in after.iterrows():
-        if row["Low"] <= sl:          # 同じ足で利確にも触れていても、保守的に損切り扱い
-            exit_type, exit_price, exit_at = "損切", min(sl, row["Open"]), t
-            break
-        if row["High"] >= tp:
-            exit_type, exit_price, exit_at = "利確", max(tp, row["Open"]), t
-            break
-    if exit_type is None:
+    # 損切/利確ラインに最初に触れた足を探す (iterrows で1本ずつ見るより桁違いに速い)
+    hit_sl = (after["Low"] <= sl).to_numpy()
+    hit_tp = (after["High"] >= tp).to_numpy()
+    touched = hit_sl | hit_tp
+    if touched.any():
+        i = int(touched.argmax())
+        exit_at, bar_open = after.index[i], after["Open"].iloc[i]
+        if hit_sl[i]:                 # 同じ足で利確にも触れていても、保守的に損切り扱い
+            exit_type, exit_price = "損切", min(sl, bar_open)
+        else:
+            exit_type, exit_price = "利確", max(tp, bar_open)
+    else:
         exit_type = "大引け" if args.hold_minutes is None else "時間切れ"
         exit_price, exit_at = float(after["Close"].iloc[-1]), after.index[-1]
 
@@ -194,16 +198,20 @@ def main():
         intra, day, mask = intraday.get(sym), daily[sym], masks[sym]
         if intra is None:
             continue
-        dates = sorted(set(intra.index.date))
-        for d in dates:
-            past = day[day.index.date < d]
-            today_daily = day[day.index.date == d]
-            if past.empty or today_daily.empty or not mask.loc[past.index[-1]]:
-                continue  # その日の朝のウォッチリストに入っていない
-            bars = intra[intra.index.date == d]
-            past_bars = intra[intra.index.date < d]
-            if len({x for x in past_bars.index.date}) < strategy.RVOL_MIN_DAYS:
+        # 日付での切り出しは銘柄ごとに1回だけ (毎日 index.date を作り直すと遅い)
+        bars_by_day = dict(tuple(intra.groupby(intra.index.date)))
+        dates = sorted(bars_by_day)
+        day_dates = list(day.index.date)
+        for i, d in enumerate(dates):
+            if i < strategy.RVOL_MIN_DAYS:
                 continue  # 期間の最初の数日は RVOL の比較対象がない
+            lo, hi = bisect_left(day_dates, d), bisect_right(day_dates, d)
+            past, today_daily = day.iloc[:lo], day.iloc[lo:hi]
+            if past.empty or today_daily.empty or not mask.iloc[lo - 1]:
+                continue  # その日の朝のウォッチリストに入っていない
+            bars = bars_by_day[d]
+            # evaluate が見るのは直近 RVOL_DAYS 日分だけなので、それだけ渡す
+            past_bars = pd.concat([bars_by_day[x] for x in dates[max(0, i - strategy.RVOL_DAYS):i]])
             trade_days.add(d)
             row = {"date": d, "code": sym.removesuffix(SUFFIX)}
             if catalysts is not None:

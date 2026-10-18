@@ -192,9 +192,11 @@ def download(symbols, chunk_size=100, on_chunk=None, pause=0, **kwargs):
         except Exception as e:
             print(f"取得エラー ({chunk[0]}〜): {e}")
             continue
+        multi = isinstance(data.columns, pd.MultiIndex)
+        got = set(data.columns.get_level_values(0)) if multi else set()
         for sym in chunk:
-            if isinstance(data.columns, pd.MultiIndex):
-                if sym not in data.columns.get_level_values(0):
+            if multi:
+                if sym not in got:
                     continue
                 df = data[sym]
             else:

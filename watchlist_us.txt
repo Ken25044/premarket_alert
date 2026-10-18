@@ -1,0 +1,8 @@
+# 監視する米国株ティッカー (1行1銘柄)
+AAPL  # Apple
+MSFT  # Microsoft
+NVDA  # NVIDIA
+TSLA  # Tesla
+AMZN  # Amazon
+META  # Meta
+

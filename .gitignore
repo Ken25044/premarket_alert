@@ -1,0 +1,16 @@
+# 機密情報 (Slack Webhook URL)
+secrets.env
+
+# ログ
+*.log
+
+# 毎朝自動生成されるファイル
+watchlist.txt
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# macOS
+.DS_Store

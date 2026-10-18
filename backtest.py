@@ -1,174 +1,205 @@
+"""アラート条件を過去の全営業日に機械的に当てはめるバックテスト
+
+銘柄や日付を手で選ばず、取得できる期間の全営業日 × 全銘柄について次を再現する。
+
+1. その日の朝のウォッチリスト: 前営業日までの日足で strategy.watchlist_mask を判定
+2. 前日の過熱フィルター:      strategy.prev_day_ok
+3. 通知時点で「見えていた」データ: 実行時刻 (--run-time) から遅延 (--delay) を引いた時刻までの分足
+   だけで strategy.evaluate を判定 (ライブの premarket_alert.py と同じ関数)
+4. エントリー: 通知を見て発注する時刻 (実行時刻 + --reaction 分) の1分足の始値 + スリッページ
+5. 決済: 利確/損切り (同じ足で両方に触れたら損切り優先) → 時間切れ → 大引け、の順
+   決済価格にもスリッページ、往復で手数料を引く
+
+比較用に「その日のウォッチリスト全銘柄を同じルールで買った場合」(ベースライン) も出す。
+アラート条件に優位性があるなら、ベースラインより成績が良いはず。
+
+使い方:
+  python backtest.py                         # 9:25実行・20分遅延・2分後に発注 (今の運用)
+  python backtest.py --run-time 09:40        # 実行を遅らせてデータが揃うのを待った場合
+  python backtest.py --universe jpx          # 今日のウォッチリストではなく東証全銘柄から再現
+  python backtest.py --csv trades.csv        # 全トレードをCSVに保存
+
+制約:
+  - yfinance の1分足は直近30日分しか取れない。サンプルは少ないので、結果は目安として見ること
+  - 1分足は 9:04〜9:05 から始まる日が大半 (寄り直後の足と寄り板の出来高が欠ける)
+  - --universe watchlist (既定) は「今日のリストに残っている銘柄」に限られるため、
+    途中で条件から外れた銘柄が抜け落ちる (生存バイアス)。厳密に見るなら --universe jpx
+"""
+import argparse
+from datetime import datetime, time as dtime, timedelta
+
 import pandas as pd
-import yfinance as yf
-from datetime import timedelta
 
-# 日本語（全角文字）が含まれていても表の列を綺麗に揃える設定
-pd.set_option('display.unicode.east_asian_width', True)
+import strategy
+from strategy import SUFFIX, TZ
 
-def backtest_daytrade(
-    targets,
-    target_date=None,
-    buy_time_str="09:30",
-    take_profit_pct=1.5,
-    stop_loss_pct=1.5,
-    max_hold_minutes=None
-):
-    """
-    targets:
-      - 銘柄と日付のペアリスト: [('3692.T', '2026-10-13'), ('3994.T', '2026-10-10'), ...]
-      - 辞書形式: {'3692.T': '2026-10-13', '3994.T': '2026-10-10'}
-      - 銘柄リスト (target_date と併用): ['3692.T', '3994.T'], target_date='2026-10-13'
-    take_profit_pct: 利確ライン (%) (デフォルト: 1.5%)
-    stop_loss_pct:   損切りライン (%) (デフォルト: 1.5%)
-    max_hold_minutes: 最大保有時間(分)。指定しない場合(None)は大引けまで監視。
-    """
-    # targets の形式を [(ticker, date), ...] に統一
-    trade_list = []
-    if isinstance(targets, dict):
-        trade_list = list(targets.items())
-    elif isinstance(targets, list):
-        if len(targets) > 0 and isinstance(targets[0], (tuple, list)):
-            trade_list = targets
-        elif target_date is not None:
-            trade_list = [(t, target_date) for t in targets]
-        else:
-            raise ValueError("各銘柄の日付を指定してください。例: [('3692.T', '2026-10-13'), ('3994.T', '2026-10-10')]")
-    else:
-        raise ValueError("targets にはリストまたは辞書を指定してください。")
+pd.set_option("display.unicode.east_asian_width", True)
+pd.set_option("display.width", 200)
 
-    print(f"\n--- バックテスト開始 (エントリー: {buy_time_str} / 利確: +{take_profit_pct}% / 損切: -{stop_loss_pct}%) ---")
+INTRADAY_DAYS = 29   # yfinance の1分足は直近30日以内
+WINDOW_DAYS = 7      # 1リクエストで取れる1分足は最大8日分
 
-    results = []
 
-    for ticker, t_date in trade_list:
-        stock = yf.Ticker(ticker)
-        # 1分足データを取得 (直近7日以内)
-        df = stock.history(start=t_date, end=pd.to_datetime(t_date) + timedelta(days=1), interval="1m")
+def parse_hhmm(s):
+    return datetime.strptime(s, "%H:%M").time()
 
-        if df.empty:
-            print(f"⚠️ {ticker} ({t_date}): データが取得できなかったよ。")
+
+def shift(t, minutes):
+    return (datetime.combine(datetime.today(), t) + timedelta(minutes=minutes)).time()
+
+
+def load_universe(name):
+    if name == "jpx":
+        from update_watchlist import get_jpx_codes
+        return get_jpx_codes()
+    from premarket_alert import load_watchlist
+    return load_watchlist()[0]
+
+
+def download_intraday(symbols):
+    """直近30日分の1分足を 7日ずつに分けて取得してつなぐ"""
+    now = pd.Timestamp.now(tz=TZ)
+    end = now.normalize() + timedelta(days=1)
+    start = (now - timedelta(days=INTRADAY_DAYS)).ceil("h")
+    parts = {}
+    while start < end:
+        stop = min(start + timedelta(days=WINDOW_DAYS), end)
+        print(f"  1分足 {start:%m/%d}〜{stop:%m/%d} を取得中...")
+        for sym, df in strategy.download(symbols, start=start, end=stop, interval="1m").items():
+            parts.setdefault(sym, []).append(df)
+        start = stop
+    return {sym: pd.concat(dfs).sort_index().loc[lambda d: ~d.index.duplicated()] for sym, dfs in parts.items()}
+
+
+def simulate(bars, entry_time, args):
+    """entry_time 以降の1分足でエントリーから決済までを再現する。戻り値は dict / None"""
+    after = bars[bars.index.time >= entry_time]
+    if after.empty:
+        return None
+    entry_at = after.index[0]
+    buy = float(after["Open"].iloc[0]) * (1 + args.slippage / 100)
+    tp, sl = buy * (1 + args.tp / 100), buy * (1 - args.sl / 100)
+    if args.hold_minutes is not None:
+        after = after[after.index <= entry_at + timedelta(minutes=args.hold_minutes)]
+
+    exit_type, exit_price, exit_at = None, None, None
+    for t, row in after.iterrows():
+        if row["Low"] <= sl:          # 同じ足で利確にも触れていても、保守的に損切り扱い
+            exit_type, exit_price, exit_at = "損切", min(sl, row["Open"]), t
+            break
+        if row["High"] >= tp:
+            exit_type, exit_price, exit_at = "利確", max(tp, row["Open"]), t
+            break
+    if exit_type is None:
+        exit_type = "大引け" if args.hold_minutes is None else "時間切れ"
+        exit_price, exit_at = float(after["Close"].iloc[-1]), after.index[-1]
+
+    sell = exit_price * (1 - args.slippage / 100)
+    ret = (sell / buy - 1) * 100 - args.fee * 2
+    return {"entry_at": entry_at, "buy": buy, "exit_at": exit_at, "sell": sell,
+            "exit_type": exit_type, "return_pct": ret,
+            "hold_min": int((exit_at - entry_at).total_seconds() // 60)}
+
+
+def summarize(label, trades, days):
+    print(f"\n=== {label} ===")
+    if trades.empty:
+        print("トレードなし")
+        return
+    r = trades["return_pct"]
+    wins, losses = r[r > 0], r[r <= 0]
+    pf = wins.sum() / -losses.sum() if losses.sum() < 0 else float("inf")
+    by_type = trades["exit_type"].value_counts().to_dict()
+    print(f"トレード数        {len(trades)} 件 ({days} 営業日 / 1日平均 {len(trades) / days:.1f} 件)")
+    print(f"勝率              {len(wins) / len(trades):.1%} ({len(wins)}勝 {len(losses)}敗)")
+    print(f"平均損益          {r.mean():+.2f}%  (中央値 {r.median():+.2f}%)")
+    print(f"平均利益 / 平均損失 {wins.mean() if len(wins) else 0:+.2f}% / {losses.mean() if len(losses) else 0:+.2f}%")
+    print(f"プロフィットファクター {pf:.2f}")
+    print(f"合計 (1トレード100万円) {r.sum() * 10000:+,.0f} 円")
+    print(f"決済の内訳        {by_type}")
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--run-time", default="09:25", help="アラートの実行時刻 (既定 09:25)")
+    p.add_argument("--delay", type=int, default=20, help="データの遅延 (分, 既定 20)")
+    p.add_argument("--reaction", type=int, default=2, help="通知から発注までの時間 (分, 既定 2)")
+    p.add_argument("--tp", type=float, default=1.5, help="利確ライン %% (既定 1.5)")
+    p.add_argument("--sl", type=float, default=1.5, help="損切りライン %% (既定 1.5)")
+    p.add_argument("--hold-minutes", type=int, default=None, help="最大保有時間 (分, 既定は大引けまで)")
+    p.add_argument("--slippage", type=float, default=0.1, help="片道のスリッページ %% (既定 0.1)")
+    p.add_argument("--fee", type=float, default=0.0, help="片道の手数料 %% (既定 0)")
+    p.add_argument("--universe", choices=["watchlist", "jpx"], default="watchlist")
+    p.add_argument("--csv", help="全トレードを保存するCSVのパス")
+    args = p.parse_args()
+
+    run_time = parse_hhmm(args.run_time)
+    data_until = shift(run_time, -args.delay)       # 通知時点で見えている最後の足
+    entry_time = shift(run_time, args.reaction)     # 実際に発注できる時刻
+    print(f"実行 {run_time:%H:%M} / 見えているデータ {data_until:%H:%M} まで / エントリー {entry_time:%H:%M}"
+          f" / 利確 +{args.tp}% / 損切 -{args.sl}% / スリッページ 片道{args.slippage}% / 手数料 片道{args.fee}%")
+
+    codes = load_universe(args.universe)
+    symbols = [f"{c}{SUFFIX}" for c in codes]
+    print(f"\n日足を取得中 ({len(symbols)} 銘柄)...")
+    daily = {s: d.dropna() for s, d in strategy.download(symbols, period="1y", interval="1d").items()}
+
+    # 1分足は重いので、検証期間中に一度でもウォッチリスト条件を満たした銘柄だけ取得する
+    first_day = (pd.Timestamp.now(tz=TZ) - timedelta(days=INTRADAY_DAYS)).date()
+    masks = {s: strategy.watchlist_mask(d) for s, d in daily.items()}
+    candidates = [s for s, m in masks.items() if m[m.index.date >= first_day - timedelta(days=7)].any()]
+    print(f"検証期間中にウォッチリスト入りした銘柄: {len(candidates)} / {len(daily)}")
+    intraday = download_intraday(candidates)
+
+    signals, baseline, trade_days = [], [], set()
+    for sym in candidates:
+        intra, day, mask = intraday.get(sym), daily[sym], masks[sym]
+        if intra is None:
             continue
+        dates = sorted(set(intra.index.date))
+        for d in dates:
+            past = day[day.index.date < d]
+            today_daily = day[day.index.date == d]
+            if past.empty or today_daily.empty or not mask.loc[past.index[-1]]:
+                continue  # その日の朝のウォッチリストに入っていない
+            bars = intra[intra.index.date == d]
+            past_bars = intra[intra.index.date < d]
+            if len({x for x in past_bars.index.date}) < strategy.RVOL_MIN_DAYS:
+                continue  # 期間の最初の数日は RVOL の比較対象がない
+            trade_days.add(d)
+            row = {"date": d, "code": sym.removesuffix(SUFFIX)}
 
-        # タイムゾーンを日本時間に合わせる
-        df.index = df.index.tz_convert('Asia/Tokyo')
-        target_buy_time = pd.to_datetime(f"{t_date} {buy_time_str}").tz_localize('Asia/Tokyo')
+            trade = simulate(bars, entry_time, args)
+            if trade:
+                baseline.append({**row, **trade})
 
-        # 9:30以降の足を取得
-        df_from_buy = df[df.index >= target_buy_time]
-        if df_from_buy.empty:
-            print(f"⚠️ {ticker} ({t_date}): {buy_time_str} 以降のデータがないよ。")
-            continue
+            if not strategy.prev_day_ok(past):
+                continue
+            visible = bars[bars.index.time <= data_until]
+            r = strategy.evaluate(visible, past_bars, float(past["Close"].iloc[-1]),
+                                  float(today_daily["Open"].iloc[0]))
+            if r["status"] == "hit" and trade:
+                signals.append({**row, "change": r["change"], "rvol": r["rvol"], **trade})
 
-        # 1. 9:30時点（最初の足）の株価を買値とする
-        actual_buy_time = df_from_buy.index[0]
-        buy_price = df_from_buy.iloc[0]['Open']
+    days = max(len(trade_days), 1)
+    sig = pd.DataFrame(signals)
+    if not sig.empty:
+        view = sig.assign(
+            前日比=sig["change"].map("{:+.1%}".format), RVOL=sig["rvol"].map("{:.1f}".format),
+            買値=sig["buy"].round(1), 売値=sig["sell"].round(1), 損益=sig["return_pct"].map("{:+.2f}%".format),
+            エントリー=sig["entry_at"].dt.strftime("%H:%M"), 決済=sig["exit_at"].dt.strftime("%H:%M"))
+        print("\n--- シグナル一覧 ---")
+        print(view[["date", "code", "前日比", "RVOL", "エントリー", "買値", "決済", "売値", "exit_type", "損益"]]
+              .sort_values(["date", "code"]).to_string(index=False))
+    if trade_days:
+        print(f"\n検証期間: {min(trade_days)} 〜 {max(trade_days)}")
+    summarize("アラート条件でエントリー", sig, days)
+    summarize("ベースライン: その日のウォッチリスト全銘柄を同じルールで買った場合", pd.DataFrame(baseline), days)
 
-        # 利確・損切りの目標価格
-        tp_price = buy_price * (1 + take_profit_pct / 100)
-        sl_price = buy_price * (1 - stop_loss_pct / 100)
-
-        # 監視対象データ
-        df_trade = df_from_buy.copy()
-        if max_hold_minutes is not None:
-            limit_time = actual_buy_time + timedelta(minutes=max_hold_minutes)
-            df_trade = df_trade[df_trade.index <= limit_time]
-
-        exit_type = None
-        exit_price = None
-        exit_time = None
-        hold_minutes = 0
-
-        # 時系列順（1分足ごと）に利確・損切りを判定
-        for t, row in df_trade.iterrows():
-            minutes_passed = int((t - actual_buy_time).total_seconds() / 60)
-
-            hit_tp = row['High'] >= tp_price
-            hit_sl = row['Low'] <= sl_price
-
-            if hit_tp and hit_sl:
-                # 同一の足で両方に達した場合（保守的に損切りを優先）
-                exit_type = "損切"
-                exit_price = sl_price
-                exit_time = t
-                hold_minutes = minutes_passed
-                break
-            elif hit_tp:
-                exit_type = "利確"
-                exit_price = tp_price
-                exit_time = t
-                hold_minutes = minutes_passed
-                break
-            elif hit_sl:
-                exit_type = "損切"
-                exit_price = sl_price
-                exit_time = t
-                hold_minutes = minutes_passed
-                break
-
-        # どちらのラインにも達しなかった場合
-        if exit_price is None:
-            exit_type = "引け手仕舞い" if max_hold_minutes is None else "時間切れ"
-            exit_price = df_trade.iloc[-1]['Close']
-            exit_time = df_trade.index[-1]
-            hold_minutes = int((exit_time - actual_buy_time).total_seconds() / 60)
-
-        profit = exit_price - buy_price
-        return_pct = (profit / buy_price) * 100
-
-        # 結果を保存
-        results.append({
-            '日付': t_date,
-            '銘柄': ticker,
-            '9:30買値': round(buy_price, 1),
-            '決済価格': round(exit_price, 1),
-            '結果': exit_type,
-            '損益(円)': round(profit, 1),
-            '回収率(%)': round(return_pct, 2),
-            '保有時間': f"{hold_minutes}分"
-        })
-
-    df_results = pd.DataFrame(results)
-
-    if df_results.empty:
-        return "テストできる銘柄がなかったよ。"
-
-    # --- 全体の集計 ---
-    total_trades = len(df_results)
-    tp_count = len(df_results[df_results['結果'] == '利確'])
-    sl_count = len(df_results[df_results['結果'] == '損切'])
-    other_count = total_trades - tp_count - sl_count
-
-    win_trades = len(df_results[df_results['損益(円)'] > 0])
-    win_rate = (win_trades / total_trades) * 100
-    avg_return = df_results['回収率(%)'].mean()
-    total_profit = df_results['損益(円)'].sum()
-    total_profit_100 = int(round(total_profit * 100))
-
-    print("\n--- 個別結果 ---")
-    print(df_results.to_string(index=False))
-
-    print(f"\n--- 全体集計 (全 {total_trades} トレード) ---")
-    print(f"【トータル損益】   {total_profit:+,.1f} 円 (1株) / {total_profit_100:+,.0f} 円 (100株運用)")
-    print(f"【勝率】           {win_rate:5.1f}% ({win_trades}勝 {total_trades - win_trades}敗)")
-    print(f"【平均回収率】     {avg_return:+6.2f}%")
-    print(f"【利確 (+{take_profit_pct}%)】   {tp_count} 件")
-    print(f"【損切 (-{stop_loss_pct}%)】   {sl_count} 件")
-    if other_count > 0:
-        label = "引け手仕舞い" if max_hold_minutes is None else "時間切れ手仕舞い"
-        print(f"【{label}】 {other_count} 件")
-
-    return df_results
+    if args.csv and not sig.empty:
+        sig.to_csv(args.csv, index=False)
+        print(f"\n{args.csv} に保存しました")
 
 
-# ----------------------------------------------------
-# 実行例：銘柄ごとにそれぞれ日付を指定
-# ----------------------------------------------------
-targets = [
-    ('3692.T', '2026-10-08'),
-    ('3994.T', '2026-10-09'),
-    ('9107.T', '2026-10-13'),
-    ('6264.T', '2026-10-13'),
-]
-
-# 利確 +1.5% / 損切り -1.5% でバックテスト実行
-df = backtest_daytrade(targets, take_profit_pct=1.5, stop_loss_pct=1.5)
+if __name__ == "__main__":
+    main()
